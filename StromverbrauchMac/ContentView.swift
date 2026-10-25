@@ -6,17 +6,20 @@ struct MeterReading: Identifiable, Codable, Equatable {
     var date: Date
     var value: Double
     var pricePerKilowattHour: Double
+    var note: String?
 
     init(
         id: UUID = UUID(),
         date: Date,
         value: Double,
-        pricePerKilowattHour: Double
+        pricePerKilowattHour: Double,
+        note: String? = nil
     ) {
         self.id = id
         self.date = date
         self.value = value
         self.pricePerKilowattHour = pricePerKilowattHour
+        self.note = note
     }
 }
 
@@ -87,15 +90,15 @@ struct ContentView: View {
             .sorted { $0.startDate > $1.startDate }
     }
 
-    private var currentMonthEstimate: MonthlyEstimate? {
-        let currentMonthReadings = sortedReadings.filter {
-            Calendar.current.isDate($0.date, equalTo: Date(), toGranularity: .month)
+    private func monthlyEstimate(for month: MonthPeriod) -> MonthlyEstimate? {
+        let monthReadings = sortedReadings.filter {
+            Calendar.current.isDate($0.date, equalTo: month.startDate, toGranularity: .month)
         }
         guard
-            let first = currentMonthReadings.first,
-            let last = currentMonthReadings.last,
-            currentMonthReadings.count > 1,
-            let dayRange = Calendar.current.range(of: .day, in: .month, for: Date())
+            let first = monthReadings.first,
+            let last = monthReadings.last,
+            monthReadings.count > 1,
+            let dayRange = Calendar.current.range(of: .day, in: .month, for: month.startDate)
         else {
             return nil
         }
@@ -115,10 +118,18 @@ struct ContentView: View {
         )
     }
 
-    private var annualForecast: AnnualForecast? {
-        guard let currentMonthEstimate, currentMonthlyInstallment > 0 else { return nil }
+    private var monthlyEstimates: [MonthlyEstimate] {
+        availableMonths.compactMap(monthlyEstimate(for:))
+    }
 
-        let annualCost = currentMonthEstimate.projectedCost * 12
+    private var annualForecast: AnnualForecast? {
+        guard !monthlyEstimates.isEmpty, currentMonthlyInstallment > 0 else { return nil }
+
+        let averageMonthlyCost = monthlyEstimates
+            .map(\.projectedCost)
+            .reduce(0, +) / Double(monthlyEstimates.count)
+        let annualCost = averageMonthlyCost * 12
+
         return AnnualForecast(
             annualCost: annualCost,
             paidInInstallments: currentMonthlyInstallment * 11,
@@ -134,6 +145,7 @@ struct ContentView: View {
                     AnnualForecastCard(
                         forecast: annualForecast,
                         currentMonthlyInstallment: currentMonthlyInstallment,
+                        estimateCount: monthlyEstimates.count,
                         onEdit: { showingTariffSettings = true }
                     )
                     MonthPicker(months: availableMonths, readings: readings)
@@ -169,7 +181,8 @@ struct ContentView: View {
                     readings: sortedReadings,
                     pricePerKilowattHour: pricePerKilowattHour,
                     monthlyBasePrice: monthlyBasePrice,
-                    onDelete: deleteReading
+                    onDelete: deleteReading,
+                    onUpdate: updateReading
                 )
             }
             .sheet(isPresented: $showingAddReading) {
@@ -182,7 +195,8 @@ struct ContentView: View {
                 TariffSettingsView(
                     pricePerKilowattHour: $pricePerKilowattHour,
                     monthlyBasePrice: $monthlyBasePrice,
-                    currentMonthlyInstallment: $currentMonthlyInstallment
+                    currentMonthlyInstallment: $currentMonthlyInstallment,
+                    
                 )
             }
             .task {
@@ -198,6 +212,13 @@ struct ContentView: View {
 
     private func deleteReading(_ reading: MeterReading) {
         readings.removeAll { $0.id == reading.id }
+        saveReadings()
+    }
+
+    private func updateReading(_ updatedReading: MeterReading) {
+        guard let index = readings.firstIndex(where: { $0.id == updatedReading.id }) else { return }
+
+        readings[index] = updatedReading
         saveReadings()
     }
 
@@ -239,6 +260,7 @@ private struct StartHeader: View {
 private struct AnnualForecastCard: View {
     let forecast: AnnualForecast?
     let currentMonthlyInstallment: Double
+    let estimateCount: Int
     let onEdit: () -> Void
 
     var body: some View {
@@ -265,6 +287,10 @@ private struct AnnualForecastCard: View {
                     value: forecast.recommendedMonthlyInstallment.formatted(.currency(code: "EUR"))
                 )
 
+                Text("Berechnet aus dem Durchschnitt von \(estimateCount) erfassten Monaten.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
                 Text(forecast.difference >= 0
                     ? "Voraussichtlich \(forecast.difference.formatted(.currency(code: "EUR")))) Guthaben im Abrechnungsmonat."
                     : "Voraussichtlich \((-forecast.difference).formatted(.currency(code: "EUR"))) Nachzahlung im Abrechnungsmonat."
@@ -272,7 +298,7 @@ private struct AnnualForecastCard: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(forecast.difference >= 0 ? .green : .red)
             } else if currentMonthlyInstallment > 0 {
-                Text("Erfasse mindestens zwei Zählerstände im laufenden Monat, damit die Jahreshochrechnung berechnet werden kann.")
+                Text("Erfasse mindestens zwei Zählerstände in einem Monat, damit die Jahreshochrechnung berechnet werden kann.")
                     .foregroundStyle(.secondary)
             } else {
                 Text("Trage deinen aktuellen monatlichen Abschlag in den Tarif-Einstellungen ein.")
@@ -341,6 +367,7 @@ private struct MonthDetailView: View {
     let pricePerKilowattHour: Double
     let monthlyBasePrice: Double
     let onDelete: (MeterReading) -> Void
+    let onUpdate: (MeterReading) -> Void
 
     @State private var readingPendingDeletion: MeterReading?
 
@@ -393,7 +420,8 @@ private struct MonthDetailView: View {
                 DailyConsumptionChart(consumptions: dailyConsumptions)
                 DailyReadingList(
                     readings: monthReadings,
-                    onDelete: { readingPendingDeletion = $0 }
+                    onDelete: { readingPendingDeletion = $0 },
+                    onUpdate: onUpdate
                 )
             }
             .padding()
@@ -558,32 +586,58 @@ private struct LegendItem: View {
 private struct DailyReadingList: View {
     let readings: [MeterReading]
     let onDelete: (MeterReading) -> Void
+    let onUpdate: (MeterReading) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Tägliche Zählerstände")
                 .font(.title2.weight(.bold))
 
-            ForEach(readings.reversed()) { reading in
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(reading.date, format: .dateTime.day().month().year())
-                            .font(.headline)
-                        Text("\(reading.value.formatted(.number.precision(.fractionLength(1)))) kWh")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button(role: .destructive) {
-                        onDelete(reading)
-                    } label: {
-                        Label("Zählerstand löschen", systemImage: "trash")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonStyle(.borderless)
+            Grid(horizontalSpacing: 16, verticalSpacing: 0) {
+                GridRow {
+                    Text("Datum")
+                    Text("Zählerstand")
+                    Text("Notiz")
                 }
-                .padding()
-                .background(.background, in: RoundedRectangle(cornerRadius: 16))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+                Divider()
+                    .gridCellColumns(3)
+
+                ForEach(readings.reversed()) { reading in
+                    GridRow {
+                        Text(reading.date, format: .dateTime.day().month().year())
+                            .frame(width: 100, alignment: .leading)
+                        Text("\(reading.value.formatted(.number.precision(.fractionLength(1)))) kWh")
+                            .frame(width: 120, alignment: .leading)
+                        HStack(spacing: 8) {
+                            TextField(
+                                "Notiz hinzufügen",
+                                text: Binding(
+                                    get: { reading.note ?? "" },
+                                    set: { note in
+                                        var updatedReading = reading
+                                        updatedReading.note = note.isEmpty ? nil : note
+                                        onUpdate(updatedReading)
+                                    }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: .infinity)
+
+                            Button(role: .destructive) {
+                                onDelete(reading)
+                            } label: {
+                                Label("Zählerstand löschen", systemImage: "trash")
+                                    .labelStyle(.iconOnly)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.vertical, 6)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -619,6 +673,7 @@ private struct AddReadingView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var date = Date()
     @State private var meterValue = ""
+    @State private var note = ""
 
     private var meterValueNumber: Double? {
         Double(meterValue.replacingOccurrences(of: ",", with: "."))
@@ -635,6 +690,7 @@ private struct AddReadingView: View {
                 Section("Täglicher Zählerstand") {
                     DatePicker("Datum", selection: $date, displayedComponents: .date)
                     TextField("Zählerstand in kWh", text: $meterValue)
+                    TextField("Notiz", text: $note)
                 }
                 Section("Gespeicherter Tarif") {
                     LabeledContent("Arbeitspreis", value: "\(pricePerKilowattHour.formatted(.currency(code: "EUR"))) / kWh")
@@ -651,7 +707,8 @@ private struct AddReadingView: View {
                         onSave(MeterReading(
                             date: date,
                             value: meterValueNumber,
-                            pricePerKilowattHour: pricePerKilowattHour
+                            pricePerKilowattHour: pricePerKilowattHour,
+                            note: note.isEmpty ? nil : note
                         ))
                         dismiss()
                     }
@@ -665,16 +722,24 @@ private struct AddReadingView: View {
 private struct TariffSettingsView: View {
     @Binding var pricePerKilowattHour: Double
     @Binding var monthlyBasePrice: Double
+    @Binding var currentMonthlyInstallment: Double
 
     @Environment(\.dismiss) private var dismiss
     @State private var priceText: String
     @State private var basePriceText: String
+    @State private var monthlyInstallmentText: String
 
-    init(pricePerKilowattHour: Binding<Double>, monthlyBasePrice: Binding<Double>) {
+    init(
+        pricePerKilowattHour: Binding<Double>,
+        monthlyBasePrice: Binding<Double>,
+        currentMonthlyInstallment: Binding<Double>
+    ) {
         _pricePerKilowattHour = pricePerKilowattHour
         _monthlyBasePrice = monthlyBasePrice
+        _currentMonthlyInstallment = currentMonthlyInstallment
         _priceText = State(initialValue: pricePerKilowattHour.wrappedValue.formatted(.number))
         _basePriceText = State(initialValue: monthlyBasePrice.wrappedValue.formatted(.number))
+        _monthlyInstallmentText = State(initialValue: currentMonthlyInstallment.wrappedValue.formatted(.number))
     }
 
     private var price: Double? {
@@ -685,9 +750,13 @@ private struct TariffSettingsView: View {
         Double(basePriceText.replacingOccurrences(of: ",", with: "."))
     }
 
+    private var monthlyInstallment: Double? {
+        Double(monthlyInstallmentText.replacingOccurrences(of: ",", with: "."))
+    }
+
     private var isValid: Bool {
-        guard let price, let basePrice else { return false }
-        return price >= 0 && basePrice >= 0
+        guard let price, let basePrice, let monthlyInstallment else { return false }
+        return price >= 0 && basePrice >= 0 && monthlyInstallment >= 0
     }
 
     var body: some View {
@@ -699,6 +768,9 @@ private struct TariffSettingsView: View {
                 Section("Grundpreis") {
                     TextField("Grundpreis pro Monat in Euro", text: $basePriceText)
                 }
+                Section("Monatlicher Abschlag") {
+                    TextField("Monatlicher Abschlag in Euro", text: $monthlyInstallmentText)
+                }
             }
             .navigationTitle("Tarif")
             .toolbar {
@@ -707,9 +779,10 @@ private struct TariffSettingsView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Sichern") {
-                        guard let price, let basePrice else { return }
+                        guard let price, let basePrice, let monthlyInstallment else { return }
                         pricePerKilowattHour = price
                         monthlyBasePrice = basePrice
+                        currentMonthlyInstallment = monthlyInstallment
                         dismiss()
                     }
                     .disabled(!isValid)
